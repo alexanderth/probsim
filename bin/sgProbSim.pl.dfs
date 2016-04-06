@@ -1,0 +1,301 @@
+#!/usr/bin/perl
+
+require "src/waveformPropagation.pl";
+use lib "/home/xiaoliac/bin/perl/lib";
+use PROBSIM;
+
+#topo sort to find stem level
+#assign cross-product & recursive sample probsim
+#output: $network_href->{$curNet}->{waveform}->{"<timeSeq>,<transSeq>"}=<prob>
+sub sgProbSim(){
+	my($outNode,$network_href,$eventlimit,$wavelimit,$glitchTh,$algorithm)=@_;
+	print "********************************\n" if($prtMsgSgProbSim);
+	print "sgProbSim:$outNode\n" 		   if($prtMsgSgProbSim);
+	print "********************************\n" if($prtMsgSgProbSim);
+	$|=1;
+	print "sgProbSim network include\n";
+	print join(",",sort keys %$network_href)."\n";
+
+	#get all nodes(inputs,internals etc) related to current sg
+	#stem level, finishTime, cumulative stem prob
+	my (%netInfo, %finishTime2Net);
+	my %netInfo=topoSortNetwork($network_href,$outNode);#added mutlidrive
+	#create %finishTime2Net, finishTime starts from 1
+	#add $sortInfo{<net>}{stem}, stem level starts from 0 which means not stem
+	#  assign input stem level, populate and calculate other stem
+	#add $sortInfo{<net>}{load}, load signals of <net>
+	foreach my $net(sort {$netInfo{$a}{finishTime}<=>$netInfo{$b}{finishTime}} keys %netInfo){
+		$finishTime2Net{$netInfo{$net}{finishTime}}=$net;
+		if($$network_href{$net}{type} eq "input"){
+			$netInfo{$net}{stem} = $netInfo{$net}{multidrive} ? 1 : 0;
+		}else{
+			my $trace = $$network_href{$net}{trace};
+			$trace  =~ s/^\(|\)$//g;
+			foreach my $input(split(/\s+/,$trace)){
+				$input =~ s/^\w+\=(.*)/$1/;
+				if(!exists $netInfo{$net}{stem} or $netInfo{$net}{stem}<$netInfo{$input}{stem}){
+					$netInfo{$net}{stem} = $netInfo{$input}{stem};
+				}
+				#$netInfo{$input}{loads} = $netInfo{$input}{loads} ? "$netInfo{$input}{loads},$net" : $net;
+			}
+			$netInfo{$net}{stem}++ if($netInfo{$net}{multidrive});
+		}
+	}
+	foreach my $net(keys %netInfo){
+		$netInfo{$net}{stem} = 0 if(!$netInfo{$net}{multidrive});
+	}
+	print "netInfo stem\n";
+	foreach my $net(sort keys %netInfo){
+		print "    time $netInfo{$net}{finishTime} net $net stem $netInfo{$net}{stem}";
+		print " multidrive $netInfo{$net}{multidrive}\n";
+		#print "loads $netInfo{$net}{loads}\n";
+	}
+
+	#initilize %waveforms
+	my %waveforms;
+	foreach my $net(%$network_href){
+		if($$network_href{$net}{type} eq "input"){
+			$waveforms{$net} = %$network{$net}{waveform};
+		}
+	}
+
+	#initilize %stems
+	#for all stem nodes, set update to 1, curCnt = 0, cpNum = 1, not include stem 0
+	my %stems;
+	$stems{curStemLevel} = 0;
+	$stems{backtrace} = 0;
+	foreach my $finishTime(sort {$a<=>$b} keys %finishTime2Net){
+		my $net = $finishTime2Net{$finishTime};
+		my $stemLevel = $netInfo{$net}{stem};
+		#initialize if $net is stem
+		if($stemLevel){
+			$stems{$stemLevel}{update} = 1; 
+			$stems{$stemLevel}{curCnt} = 0; 
+			$stems{$stemLevel}{cpNum}  = 1;
+			$stems{$stemLevel}{nets}   .= ",$net";
+			$stems{$stemLevel}{nets}   =~ s/^,//;
+		}
+	}
+
+	while($curNet=getNextNode($curNet,$outNode,\%stems,\%netInfo,\%finishTime2Net)){
+		#end loop if can't get $curNet
+		last if(!$curNet);
+		#stop backtrace if get stem net>curStemLevel in backtrace process
+		if($netInfo{$curNet}{stem} > $stems{curStemLevel} && $stems{backtrace}){
+			$stems{backtrace} = 0;
+		}
+
+		#keep output waveforms to $network_href
+		propagate($curNet,$outNode,\%stems,\%sortInfo,$network_href,\%waveforms);
+		#update stemLevel if enter higher level
+		if($sortInfo{$curNet}{stem} && $sortInfo{$curNet}{stem} >= $stems{curStemLevel}){
+			$stems{curStemLevel} = $sortInfo{$curNet}{stem};
+			updateStemEvents(\%waveforms,\%stems,$network_href);
+		}
+		#update curStemLevel cpNum if curStemLevel is in updating
+		if($sortInfo{$curNet}{stem} && $stems{$stems{curStemLevel}}{update}){
+			my $waveformsNum = scalar(keys %{$network_href->{$curNet}->{waveform}});
+			my $oriCpNum = $stems{$stems{curStemLevel}}{cpNum};
+			$stems{$stems{curStemLevel}}{cpNum} *= $waveformsNum;
+			print "    $curNet updates stemLevel $stems{curStemLevel} cpNum by x $waveformsNum," if($verbose>2);
+			print "from $oriCpNum to $stems{$stems{curStemLevel}}{cpNum}\n" if($verbose>2);
+		}
+		if($curNet eq $outNode){
+			print "-N-\n" if($verbose>2);
+		}
+		print "\n" if($verbose>2);
+	}
+	foreach my $waveform(sort keys %{$network_href->{$outNode}->{waveform}}){
+		next if($waveform =~ /^\s*$/);
+		print "$waveform:$network_href->{$outNode}->{waveform}->{$waveform}\n" if($verbose>2);
+	}
+	print "finish $outNode with ".scalar(keys %{$network_href->{$outNode}->{waveform}})." waveforms\n\n" if($verbose>2);
+}
+
+#input: $curNode, $conn_ref
+#output: $conn_ref->{$curNode}->{waveform}->{r/f,t}=p
+#algorithm
+#get all inputs based on $conn_ref
+#if input is input/sg(not curSg), get all waveforms
+#if input is stem, 
+#	if(first time)
+#		push to $stems->{stem}
+#	else
+#		get 1 waveform cp based on $stems->{stem}->{curCnt}
+#propagate($curNet,$outNode,\%stems,\%sortInfo,$network_href,\%waveforms);
+sub propagate(){
+	my($curNet,$outNode,$stems_href,$sortInfo_href,$network_href,$waveforms_href)=@_;
+	print "----propagate $curNet (outNode is $outNode)\n" if($verbose>2);
+	my(%inputWaveform);
+	##update curStemNodes
+	##changed by xiaoliac @04082014
+	#if($sortInfo_href->{$curNet}->{stem} && !defined $stems_href->{curStemNets}->{$curNet}){
+	#	$stems_href->{curStemNets}->{$curNet} = 1;
+	#}
+	#calculate
+	if($network_href->{$curNet}->{type} =~ /input/ or ($network_href->{$curNet}->{isSg} && $curNet ne $outNode)){
+		print "    input node has been skipped\n" if($verbose>2);
+	}
+	elsif($stems_href->{backtrace} && $sortInfo_href->{$curNet}->{stem}){
+		print "    backtrace stem has been skipped\n" if($verbose>2);
+	}
+	else{
+		#delete previous waveforms first unless sgNode
+		delete $network_href->{$curNet}->{waveform} if($curNet ne $outNode);
+		#calculate prob
+		my @inputs = split(/\s+/,$network_href->{$curNet}->{trace});
+		my $gate = $network_href->{$curNet}->{gate};
+		my %waveforms;
+		my $gatedelay = 1;
+		$gate =~ s/2?X1//;
+		#set all input waveforms
+		my $probCnt = 1;
+		foreach my $input(@inputs){
+			$input =~ s/(\(|\))//g;
+			$input =~ s/^[^\=]\=(.*)/$1/;
+			if(!$sortInfo_href->{$input}->{stem} || $network_href->{$input}->{type} eq "input"){
+				#print "    assign $input inputWaveforms ".scalar(keys %{$conn_ref->{$input}->{waveform}})." values";
+				$inputWaveform{$input} = $network_href->{$input}->{waveform};
+			}else{
+				#print "    assign $input inputWaveform ".scalar(keys %{$events_href->{$input}})." values";
+				$inputWaveform{$input} = $waveforms_href->{$input};
+			}
+			print ", include ".join(";",sort keys %{$inputWaveform{$input}})."\n";
+			$probCnt *= scalar(keys %{$inputWaveform{$input}});
+		}
+		#calc prob for each cross-product
+		my($waveformNum,$remainder,$quotient,$event,$prob,%cpWaveform,%cpProb);
+		for(my $i=0;$i<$probCnt;$i++){
+			#get cp based on $i
+			$quotient = $i;
+			my ($in1time,$in1Trans,$in1Prob,$in2time,$in2Trans,$in2Prob);
+			for(my $i=0;$i<@inputs;$i++){
+				my $input = $inputs[$i];
+				$waveformNum = scalar(keys %{$inputWaveform{$input}});
+				$remainder = $quotient%$waveformNum;
+				$quotient = $quotient/$waveformNum;
+				$cpWaveform{$input} = (sort keys %{$inputWaveform{$input}})[$remainder];
+				$cpProb{$input} = $inputWaveform{$input}{$cpWaveform{$input}};
+				#record stem node event and prob for prob scaling
+				if($sortInfo_href->{$input}->{stem}){
+					$sortInfo_href->{$input}->{waveform} = $cpWaveform{$input};
+					$sortInfo_href->{$input}->{prob}  = $cpProb{$input};
+				}
+				#print "    assign $input cpevent $cpEvent{$input} to $cpProb{$input}\n";
+				if($i == 0){
+					($in1Time,$in1Trans)	= split(",",$cpWaveform{$input});
+					#prob=1 if stem
+					$in1Prob		= $sortInfo_href->{$input}->{stem} ? 1 : $cpProb{$input};
+				}elsif($i == 1){
+					($in2Time,$in2Trans)	= split(",",$cpWaveform{$input});
+					#prob=1 if stem
+					$in2Prob		= $sortInfo_href->{$input}->{stem} ? 1 : $cpProb{$input};
+				}else{
+					print "ERROR: There are more than 2 inputs for this device.\n";
+				}
+			}
+			my ($outTime,$outTrans,$outProb,%out);
+			my $gateDelay = 1;
+			#propagate prob through a gate
+			print "    calc: gate $gate, in1 Time/trans/prob, $in1Time/$in1Trans/$in1Prob, in2 Time/trans/prob, $in2Time/$in2Trans/$in2Prob\n" if($verbose>2);
+			%out = waveformPropagation("$in1Time,$in1Trans",$in1Prob,"$in2Time,$in2Trans",$in2Prob,$gate,$gateDelay,$eventlimit,$glitchth);
+			$outTime	= $out{time};
+			$outTrans	= $out{trans};
+			$outProb	= $out{prob};
+			#for all stem nodes, find assigned events, find prob, do prob scaling
+			if($curNet eq $outNode){
+				my $stemProbScale = 1;
+				foreach my $net(sort keys %$sortInfo_href){
+					if($sortInfo_href->{$net}->{stem} && $net ne $outNode){
+						my $curStemEvent = $sortInfo_href->{$net}->{event};
+						my $curStemProb  = $sortInfo_href->{$net}->{prob};
+						$stemProbScale *= $curStemProb;
+						print "    scaling: stem node $net, event $curStemEvent, prob $curStemProb, curStemProbScale $stemProbScale\n" if($verbose>2);
+					}
+				}
+				$outProb *= $stemProbScale;
+			}
+			if(!defined $network_href->{$curNode}->{waveform}->{"$outTime,$outTrans"}){
+				$network_href->{$curNode}->{waveform}->{"$outTime,$outTrans"} = $outProb;
+			}else{
+				$network_href->{$curNode}->{waveform}->{"$outTime,$outTrans"} += $outProb;
+			}
+			print "  --out time/trans/prob $outTime/$outTrans/$outProb, sum ".$network_href->{$curNode}->{waveform}->{"$outTime,$outTrans"}."\n" if($verbose>2);
+		}
+	}
+	print "----node $curNet has ".scalar(keys %{$network_href->{$curNet}->{waveform}})." events\n" if($verbose>2);
+	foreach my $waveform (sort keys %{$network_href->{$curNet}->{waveform}}){
+		print "    ".$waveform if($verbose>2);
+		print "    ".$network_href->{$curNet}->{waveform}->{$waveform}."\n" if($verbose>2);
+	}
+}
+
+#assign/update values to stem nodes based on curStemLevel and curCnt
+#update if cnt change
+sub updateStemEvents(){
+print "----update stem events\n" if($verbose>2);
+	my($events_href,$stems_href,$conn_ref)=@_;
+	my $curStemLevel = $stems_href->{curStemLevel};
+	my $curCnt = $stems_href->{$curStemLevel}->{curCnt};
+	my $nodes = $stems_href->{$curStemLevel}->{nodes};
+	my ($quotient,$remainder,$eventsNum);
+	$quotient = $curCnt;
+	foreach my $node(split(/,/,$nodes)){
+		my $eventsNum = scalar(keys %{$conn_ref->{$node}->{waveform}});
+		last if(!$eventsNum);
+		$remainder = $quotient%$eventsNum;
+		$quotient = $quotient/$eventsNum;
+		$event = (sort keys %{$conn_ref->{$node}->{waveform}})[$remainder];
+		$prob = $conn_ref->{$node}->{waveform}->{$event};
+		delete $events_href->{$node};
+		$events_href->{$node}->{$event} = $prob;
+	}
+	print "    curStemLevel is $curStemLevel, curCnt is $curCnt\n" if($verbose>2);
+}
+
+#%state
+#$stems->{0}->{active}
+#$stems->{0}->{curCnt}
+#$stems->{0}->{cpNum}
+#$stems->{0}->{nodes}
+sub getNextNode(){
+print "----getNextNode\n" if($verbose>2);
+	my($curNet,$outNode,$stems_href,$sortInfo_href,$finishTime2Net)=@_;
+	my $nextNet;
+	#if in progress, find next in order
+	if($curNet ne $outNode){
+		my $nextOrder = $curNet ? ($sortInfo_href->{$curNet}->{finishTime} + 1) : 1;
+print "nextOrder is $nextOrder\n";
+		$nextNet = $finishTime2Net->{$nextOrder};
+	}
+	#if reach the end, get new cross-product
+	else{
+		print "    get new cp\n" if($verbose>2);
+		for(my $stemLevel = $stems_href->{curStemLevel};$stemLevel>0;$stemLevel--){
+			$stems_href->{$stemLevel}->{curCnt} += 1;
+			$stems_href->{backtrace} = 1;
+			print "    getNextNode: check stemLevel $stemLevel; curCnt $stems_href->{$stemLevel}->{curCnt}, cp $stems_href->{$stemLevel}->{cpNum}\n" if($verbose>2);
+			if($stems_href->{$stemLevel}->{curCnt} >= $stems_href->{$stemLevel}->{cpNum}){
+				#reset current stem level if it has been fully visited
+				print "    current stemLevel $stemLevel is full, go back\n" if($verbose>2);
+				$stems_href->{$stemLevel}->{cpNum}	= 1;
+				$stems_href->{$stemLevel}->{curCnt}	= 0;
+				$stems_href->{$stemLevel}->{update}	= 1;
+				$stems_href->{curStemLevel} += -1;
+				next;
+			}else{
+				#return current level smallest _changed_! node
+				$stems_href->{$stemLevel}->{update} = 0;
+				my @stemsNets=split(",",$stems_href->{$stemLevel}->{nets});
+				$nextNet = $stemsNets[0];
+				#update %events based on $stems_href->{$stemLevel}->{curCnt}
+				#updateStemEvents();
+				last;
+			}
+		}
+	}
+	print "    get net $nextNet\n" if($verbose>2);
+	return $nextNet;
+}
+
+1;
